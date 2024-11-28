@@ -22,15 +22,16 @@ import (
 
 var (
 	AnnotationTTL                     string
-	MaximumFailedExecutionBeforePanic int
-	ExecutionTimeout                  time.Duration
-	ExecutionInterval                 time.Duration
-	ThrottleDuration                  time.Duration
-	ListLimit                         int
+	Debug                             bool
 	ErrTimedOut                       = errors.New("execution timed out")
-	listTimeoutSeconds                int64
-	executionFailedCounter            = 0
-	debug                             bool
+	ExecutionFailedCounter            = 0
+	ExecutionInterval                 time.Duration
+	ExecutionTimeout                  time.Duration
+	ListLimit                         int
+	ListTimeoutSeconds                int64
+	MaximumFailedExecutionBeforePanic int
+	ThrottleDuration                  time.Duration
+	WhitelistedResources              []string
 )
 
 func init() {
@@ -40,8 +41,16 @@ func init() {
 	ExecutionInterval = getEnvDuration("EXECUTION_INTERVAL", 5*time.Minute)
 	ThrottleDuration = getEnvDuration("THROTTLE_DURATION", 50*time.Millisecond)
 	ListLimit = getEnvInt("LIST_LIMIT", 500)
-	listTimeoutSeconds = int64(getEnvInt("LIST_TIMEOUT_SECONDS", 60))
-	debug = getEnv("DEBUG", "false") == "true"
+	ListTimeoutSeconds = int64(getEnvInt("LIST_TIMEOUT_SECONDS", 60))
+	Debug = getEnv("DEBUG", "false") == "true"
+	WhitelistedResourcesStr := getEnv("RESOURCE_WHITELIST", "")
+	if WhitelistedResourcesStr != "" {
+		WhitelistedResources = strings.Split(WhitelistedResourcesStr, ",")
+		// Trim whitespace from substrings
+		for i, s := range WhitelistedResources {
+			WhitelistedResources[i] = strings.TrimSpace(s)
+		}
+	}
 }
 
 func main() {
@@ -77,13 +86,13 @@ func main() {
 			start := time.Now()
 			if err := Reconcile(ctx, kubernetesClient, dynamicClient, eventManager); err != nil {
 				log.Printf("Error during execution: %s", err.Error())
-				executionFailedCounter++
-				if executionFailedCounter > MaximumFailedExecutionBeforePanic {
-					panic(fmt.Errorf("execution failed %d times: %w", executionFailedCounter, err))
+				ExecutionFailedCounter++
+				if ExecutionFailedCounter > MaximumFailedExecutionBeforePanic {
+					panic(fmt.Errorf("execution failed %d times: %w", ExecutionFailedCounter, err))
 				}
-			} else if executionFailedCounter > 0 {
-				log.Printf("Execution was successful after %d failed attempts, resetting counter to 0", executionFailedCounter)
-				executionFailedCounter = 0
+			} else if ExecutionFailedCounter > 0 {
+				log.Printf("Execution was successful after %d failed attempts, resetting counter to 0", ExecutionFailedCounter)
+				ExecutionFailedCounter = 0
 			}
 			log.Printf("Execution took %dms, sleeping for %s", time.Since(start).Milliseconds(), ExecutionInterval)
 			select {
@@ -105,8 +114,42 @@ func Reconcile(ctx context.Context, kubernetesClient kubernetes.Interface, dynam
 	if err != nil {
 		return err
 	}
-	if debug {
-		log.Println("[Reconcile] Found", len(resources), "API resources")
+
+	// Filter the resources here
+	filteredResources := []*metav1.APIResourceList{}
+	for _, resourceList := range resources {
+		filteredAPIResources := []metav1.APIResource{}
+		for _, apiResource := range resourceList.APIResources {
+			// Ensure that we can list and delete the resource
+			verbs := apiResource.Verbs.String()
+			if !strings.Contains(verbs, "list") || !strings.Contains(verbs, "delete") {
+				continue
+			}
+			// Whitelist check
+			if len(WhitelistedResources) > 0 {
+				resourceWhitelisted := false
+				for _, substring := range WhitelistedResources {
+					if strings.Contains(apiResource.Name, substring) {
+						resourceWhitelisted = true
+						break
+					}
+				}
+				if !resourceWhitelisted {
+					continue
+				}
+			}
+			filteredAPIResources = append(filteredAPIResources, apiResource)
+		}
+		if len(filteredAPIResources) > 0 {
+			filteredResourceList := &metav1.APIResourceList{
+				GroupVersion: resourceList.GroupVersion,
+				APIResources: filteredAPIResources,
+			}
+			filteredResources = append(filteredResources, filteredResourceList)
+		}
+	}
+	if Debug {
+		log.Println("[Reconcile] Found", len(filteredResources), "API resources")
 	}
 
 	// Create a context with timeout
@@ -115,7 +158,7 @@ func Reconcile(ctx context.Context, kubernetesClient kubernetes.Interface, dynam
 
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- DoReconcile(timeoutCtx, dynamicClient, eventManager, resources)
+		errChan <- DoReconcile(timeoutCtx, dynamicClient, eventManager, filteredResources)
 	}()
 
 	select {
@@ -151,11 +194,6 @@ func DoReconcile(ctx context.Context, dynamicClient dynamic.Interface, eventMana
 				return ctx.Err()
 			default:
 			}
-			// Ensure that we can list and delete the resource
-			verbs := apiResource.Verbs.String()
-			if !strings.Contains(verbs, "list") || !strings.Contains(verbs, "delete") {
-				continue
-			}
 			// List all items under the resource
 			gvr.Resource = apiResource.Name
 			var continueToken string
@@ -166,7 +204,7 @@ func DoReconcile(ctx context.Context, dynamicClient dynamic.Interface, eventMana
 				default:
 				}
 				list, err := dynamicClient.Resource(gvr).List(ctx, metav1.ListOptions{
-					TimeoutSeconds: &listTimeoutSeconds,
+					TimeoutSeconds: &ListTimeoutSeconds,
 					Continue:       continueToken,
 					Limit:          int64(ListLimit),
 				})
@@ -178,7 +216,7 @@ func DoReconcile(ctx context.Context, dynamicClient dynamic.Interface, eventMana
 					break
 				}
 				continueToken = list.GetContinue()
-				if debug {
+				if Debug {
 					log.Println("Checking", len(list.Items), gvr.Resource, "from", gvr.GroupVersion())
 				}
 				for _, item := range list.Items {
@@ -211,7 +249,7 @@ func DoReconcile(ctx context.Context, dynamicClient dynamic.Interface, eventMana
 						}
 						// Cool off a tiny bit to avoid hitting the API too often
 						time.Sleep(ThrottleDuration)
-					} else if debug {
+					} else if Debug {
 						log.Printf("[%s/%s] is configured with a TTL of %s, which means it will expire in %s", apiResource.Name, item.GetName(), ttl, time.Until(item.GetCreationTimestamp().Add(ttlInDuration)).Round(time.Second))
 					}
 				}
